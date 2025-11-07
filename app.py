@@ -4,7 +4,12 @@ import numpy as np
 import joblib
 import streamlit as st
 
-# Optional: load OPENAI_API_KEY from .env if present
+# ── MUST be the first Streamlit call ───────────────────────────────────────────
+st.set_page_config(page_title="RC Beam Rebar Assistant",
+                   page_icon="🧱",
+                   layout="centered")
+
+# Optional: load OPENAI_API_KEY from .env if present (for local dev)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -24,6 +29,7 @@ TRAIN_DOMAIN = {
 # ============== LOAD MODEL ===============
 @st.cache_resource
 def load_model():
+    """Load the trained sklearn Pipeline (.pkl). Cached across reruns."""
     pipe = joblib.load(MODEL_PATH)
     return pipe
 
@@ -31,26 +37,30 @@ model = load_model()
 
 # ============== HELPERS ==================
 def predict_as(width_mm, depth_mm, moment_kNm, fck=25.0, pipe=model):
+    """Predict required As (mm²) using the trained pipeline."""
     X = pd.DataFrame([[width_mm, depth_mm, moment_kNm, fck]], columns=FEATURES)
     as_req = float(pipe.predict(X)[0])
     return as_req
 
 def bar_options(required_area_mm2, diameters=(10,12,16,20,25,32), max_bars=8,
                 beam_width_mm=None, clear_cover_mm=25, min_clear_spacing_mm=None):
-    """Single-diameter options meeting/exceeding As.
-       Returns sorted list by lowest overprovision, then fewest bars, then smaller dia."""
+    """
+    Enumerate single-diameter options that meet/exceed As.
+    Sorted by: lowest over-provision %, then fewest bars, then smaller dia.
+    If beam_width_mm is provided, also flag if the set fits given cover/spacing.
+    """
     out = []
     for d in diameters:
-        area_one = math.pi*(d**2)/4.0
-        for n in range(2, max_bars+1):
-            total = area_one*n
+        area_one = math.pi * (d**2) / 4.0
+        for n in range(2, max_bars + 1):
+            total = area_one * n
             if total >= required_area_mm2:
-                over = 100.0*(total - required_area_mm2)/required_area_mm2
+                over = 100.0 * (total - required_area_mm2) / required_area_mm2
                 fits = True
                 if beam_width_mm is not None:
-                    spacing = max(d, min_clear_spacing_mm or max(25, d))
-                    usable = beam_width_mm - 2*clear_cover_mm
-                    required_width = n*d + (n-1)*spacing
+                    spacing = max(d, (min_clear_spacing_mm or max(25, d)))
+                    usable = beam_width_mm - 2 * clear_cover_mm
+                    required_width = n * d + (n - 1) * spacing
                     fits = required_width <= usable
                 out.append({
                     "Notation": f"{n}T{d}",
@@ -65,13 +75,13 @@ def bar_options(required_area_mm2, diameters=(10,12,16,20,25,32), max_bars=8,
     return pd.DataFrame(out)
 
 def in_training_scope(b, d, m, fck):
+    """Check if inputs fall within the dataset’s training domain."""
     return (TRAIN_DOMAIN["width"][0]  <= b <= TRAIN_DOMAIN["width"][1]  and
             TRAIN_DOMAIN["depth"][0]  <= d <= TRAIN_DOMAIN["depth"][1]  and
             TRAIN_DOMAIN["moment"][0] <= m <= TRAIN_DOMAIN["moment"][1] and
             abs(fck - TRAIN_DOMAIN["fck"][0]) < 1e-9)
 
 # ============== UI =======================
-st.set_page_config(page_title="RC Beam Rebar Assistant", page_icon="🧱", layout="centered")
 st.title("🧱 RC Beam Rebar Assistant (ML + GPT)")
 
 st.markdown("""
@@ -98,16 +108,21 @@ with st.form("input_form"):
 if run_btn:
     # 1) Domain guard
     if not in_training_scope(width_mm, depth_mm, moment_k, fck):
-        st.warning(f"⚠️ Input is outside the training scope: Width 125–300, Depth 450–600, Moment 2–318, fck=25 MPa. "
-                   f"This prediction may be unreliable. Consider retraining with broader data.")
+        st.warning(
+            "⚠️ Input is outside the training scope: Width 125–300, Depth 450–600, "
+            "Moment 2–318, fck=25 MPa. Prediction may be unreliable; consider retraining with broader data."
+        )
+
     # 2) Predict As
     as_req = predict_as(width_mm, depth_mm, moment_k, fck)
     st.subheader(f"Predicted Required As: **{as_req:.1f} mm²**")
 
     # 3) Bar options table
     spacing = (min_spacing_mm if min_spacing_mm > 0 else None)
-    opts_df = bar_options(as_req, beam_width_mm=beam_width_for_fit,
-                          clear_cover_mm=clear_cover_mm, min_clear_spacing_mm=spacing)
+    opts_df = bar_options(as_req,
+                          beam_width_mm=beam_width_for_fit,
+                          clear_cover_mm=clear_cover_mm,
+                          min_clear_spacing_mm=spacing)
     st.markdown("### Bar options (ranked by lowest overprovision)")
     st.dataframe(opts_df)
 
@@ -116,13 +131,12 @@ if run_btn:
         try:
             from openai import OpenAI
             client = OpenAI()
-            # Construct a concise prompt (you can refine)
             sys = (
                 "You are an RC beam reinforcement copilot. "
                 "Explain the ML-predicted As (mm²) and bar options in plain language. "
                 "Be concise but technical. "
                 "Mention training scope limits and include a safety note to verify with the relevant design code "
-                "(e.g., EC2/BS 8110) for minimum steel, spacing, anchorage and ductility. "
+                "(e.g., EC2/BS 8110) for minimum steel, spacing, anchorage and ductility."
             )
             user = (
                 f"Inputs: width={width_mm} mm, depth={depth_mm} mm, Mu={moment_k} kNm, fck={fck} MPa. "
@@ -133,8 +147,8 @@ if run_btn:
             )
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role":"system", "content": sys},
-                          {"role":"user", "content": user}],
+                messages=[{"role": "system", "content": sys},
+                          {"role": "user", "content": user}],
                 temperature=0.2
             )
             text = resp.choices[0].message.content
@@ -148,5 +162,8 @@ if run_btn:
         st.caption("Tip: create a .env with OPENAI_API_KEY=sk-... or set it in your Streamlit Cloud secrets.")
 
 st.divider()
-st.caption("Disclaimer: Educational support only. Verify final designs against the relevant code (e.g., EC2/BS 8110) for minimum steel, spacing, anchorage and ductility. "
-           "Model scope is limited to training ranges (Width 125–300 mm, Depth 450–600 mm, Moment 2–318 kNm, Fck=25 MPa).")
+st.caption(
+    "Disclaimer: Educational support only. Verify final designs against the relevant code (e.g., EC2/BS 8110) "
+    "for minimum steel, spacing, anchorage and ductility. "
+    "Model scope is limited to training ranges (Width 125–300 mm, Depth 450–600 mm, Moment 2–318 kNm, Fck=25 MPa)."
+)
